@@ -197,7 +197,7 @@ fn key2fp(loginfo: &SSHLogInfo, pubkey64: &str) -> io::Result<String> {
             hasher.input(&pubkeydata);
             let hashed = hasher.result();
             let fp64 = base64::encode(&hashed);
-            return Ok(fp64.trim_right_matches('=').to_string());
+            return Ok(fp64.trim_end_matches('=').to_string());
         },
         SSHFingerprintType::MD5 => {
             let digest = md5::compute(&pubkeydata);
