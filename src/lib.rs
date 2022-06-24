@@ -42,6 +42,7 @@ use sha2::Digest;
 struct ProcessInfo {
     pid: nix::unistd::Pid,
     ppid: nix::unistd::Pid,
+    uid: nix::unistd::Uid,
     name: String,
 }
 
@@ -86,13 +87,14 @@ pub struct SSHInfo {
 }
 
 /// read process info for a PID from procfs (Linux only)
-fn get_pid_info(pid: nix::unistd::Pid) -> std::io::Result<(ProcessInfo)> {
+fn get_pid_info(pid: nix::unistd::Pid) -> std::io::Result<ProcessInfo> {
     let pid_info_file = format!("/proc/{}/status", pid);
-    let f = try!(std::fs::File::open(pid_info_file));
+    let f = std::fs::File::open(pid_info_file)?;
     let file = std::io::BufReader::new(&f);
 
     let mut name = String::new();
     let mut ppid = nix::unistd::Pid::from_raw(1);
+    let mut uid = nix::unistd::Uid::from_raw(0);
 
     for line in file.lines() {
         let l = line.unwrap();
@@ -103,27 +105,31 @@ fn get_pid_info(pid: nix::unistd::Pid) -> std::io::Result<(ProcessInfo)> {
             continue;
         }
         match key.unwrap() {
+            "Uid" => {
+                let val = val.unwrap().split("\t").next();
+                uid = nix::unistd::Uid::from_raw(val.unwrap().parse().unwrap());
+            },
             "PPid" => ppid = nix::unistd::Pid::from_raw(val.unwrap().parse::<libc::pid_t>().unwrap()),
             "Name" => name = val.unwrap().to_string(),
             _ => {},
         };
     }
-    Ok(ProcessInfo { pid, ppid, name } )
+    Ok(ProcessInfo { pid, ppid, uid, name } )
 }
 
 /// walk through parent processes until sshd process is found
-fn get_sshd_pid() -> std::io::Result<(nix::unistd::Pid)> {
-    let mut info = try!(get_pid_info(nix::unistd::getppid()));
+fn get_sshd_pid() -> std::io::Result<nix::unistd::Pid> {
+    let mut info = get_pid_info(nix::unistd::getppid())?;
 
     while !info.name.contains("sshd") && info.pid != nix::unistd::Pid::from_raw(1) {
-        info = try!(get_pid_info(info.ppid));
+        info = get_pid_info(info.ppid)?;
     }
 
     if info.pid == nix::unistd::Pid::from_raw(1) {
         return Err(io::Error::new(io::ErrorKind::NotFound, "sshd parent process not found"))
     }
 
-    if nix::unistd::Uid::current().is_root() {
+    if info.uid == nix::unistd::Uid::from_raw(0) {
         Ok(info.pid)
     } else {
         Ok(info.ppid)
@@ -131,16 +137,15 @@ fn get_sshd_pid() -> std::io::Result<(nix::unistd::Pid)> {
 }
 
 /// find "Accepted publickey" message for provided pid in systemd journal
-fn get_sshd_journal_entry(pid: nix::unistd::Pid) -> std::io::Result<(String)> {
-    let mut journal = try!(systemd::journal::Journal::open(systemd::journal::JournalFiles::System, false, false));
-    try!(journal.seek(systemd::journal::JournalSeek::Current));
+fn get_sshd_journal_entry(pid: nix::unistd::Pid) -> std::io::Result<String> {
+    let mut journal = systemd::journal::OpenOptions::default().system(true).open()?;
     let pidstr = format!("{}", pid);
 
-    try!(journal.match_add("SYSLOG_IDENTIFIER", "sshd"));
-    try!(journal.match_and());
-    try!(journal.match_add("SYSLOG_PID", pidstr));
+    journal.match_add("SYSLOG_IDENTIFIER", "sshd")?;
+    journal.match_and()?;
+    journal.match_add("SYSLOG_PID", pidstr)?;
 
-    let mut record = try!(journal.next_record());
+    let mut record = journal.next_entry()?;
     while record.is_some() {
         let recordmap = record.unwrap();
         let msg = recordmap.get("MESSAGE");
@@ -152,7 +157,7 @@ fn get_sshd_journal_entry(pid: nix::unistd::Pid) -> std::io::Result<(String)> {
             }
         }
 
-        record = try!(journal.next_record());
+        record = journal.next_entry()?;
     }
 
     Err(io::Error::new(io::ErrorKind::NotFound, "sshd log entry not found"))
@@ -193,9 +198,9 @@ fn key2fp(loginfo: &SSHLogInfo, pubkey64: &str) -> io::Result<String> {
 
     match loginfo.fptype {
         SSHFingerprintType::SHA256 => {
-            let mut hasher = sha2::Sha256::default();
-            hasher.input(&pubkeydata);
-            let hashed = hasher.result();
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(&pubkeydata);
+            let hashed = hasher.finalize();
             let fp64 = base64::encode(&hashed);
             return Ok(fp64.trim_end_matches('=').to_string());
         },
@@ -211,10 +216,10 @@ fn key2fp(loginfo: &SSHLogInfo, pubkey64: &str) -> io::Result<String> {
 
 /// get authorized_key information for publickey fingerprint
 fn ssh_get_authorized_key(loginfo: &SSHLogInfo) -> std::io::Result<SSHPubKey> {
-    let mut authfile = std::env::home_dir().unwrap();
+    let mut authfile = home::home_dir().unwrap();
     authfile.push(".ssh");
     authfile.push("authorized_keys");
-    let f = try!(std::fs::File::open(authfile));
+    let f = std::fs::File::open(authfile)?;
     let file = std::io::BufReader::new(&f);
 
     for line in file.lines() {
@@ -229,7 +234,11 @@ fn ssh_get_authorized_key(loginfo: &SSHLogInfo) -> std::io::Result<SSHPubKey> {
         let pubkey64 = parts[1];
         let comment = parts[2];
 
-        let pubkeyfp = try!(key2fp(&loginfo, pubkey64));
+        if keytype != loginfo.keytype {
+            /* ignore, because we do not normalize the data */
+        }
+
+        let pubkeyfp = key2fp(&loginfo, pubkey64)?;
 
         if pubkeyfp == loginfo.fingerprint {
             return Ok(SSHPubKey{keytype: keytype.to_string(), keydata: pubkey64.to_string(), comment: comment.to_string()});
@@ -241,10 +250,10 @@ fn ssh_get_authorized_key(loginfo: &SSHLogInfo) -> std::io::Result<SSHPubKey> {
 
 /// get ssh key information for UID
 pub fn get_ssh_info() -> std::io::Result<SSHInfo> {
-    let pid = try!(get_sshd_pid());
-    let msg = try!(get_sshd_journal_entry(pid));
-    let info = try!(decode_ssh_log(&msg));
-    let auth = try!(ssh_get_authorized_key(&info));
+    let pid = get_sshd_pid()?;
+    let msg = get_sshd_journal_entry(pid)?;
+    let info = decode_ssh_log(&msg)?;
+    let auth = ssh_get_authorized_key(&info)?;
 
     Ok(SSHInfo{fingerprint_type: info.fptype, fingerprint: info.fingerprint, username: info.username, ip: info.ip, keytype: auth.keytype, keydata: auth.keydata, comment: auth.comment})
 }
