@@ -249,7 +249,7 @@ fn ssh_get_authorized_key(loginfo: &SSHLogInfo) -> std::io::Result<SSHPubKey> {
 }
 
 /// get ssh key information for UID
-pub fn get_ssh_info() -> std::io::Result<SSHInfo> {
+pub fn get_ssh_journal_info() -> std::io::Result<SSHInfo> {
     let pid = get_sshd_pid()?;
     let msg = get_sshd_journal_entry(pid)?;
     let info = decode_ssh_log(&msg)?;
