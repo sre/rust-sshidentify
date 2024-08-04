@@ -2,12 +2,24 @@ Rust sshidentify
 ================
 
 The Rust `sshidentify` can be used to gain information about the
-SSH key, that has been used for the current connection. The
-public `get_ssh_info()` will traverse through the process tree
-to find the parent sshd PID. Once found the PID is being used
-to check the systemd journal for the key fingerprint having been
-used for the connection. Last but not least the `~/.ssh/authorized_keys`
-is being examined to find the public key for the fingerprint.
+SSH key, that has been used for the current connection. There are
+two different ways to get this:
+
+1. `get_ssh_exposeauth_info()`
+
+This is available when the crate is build with the "exposeauth"
+feature. The function is only usable if OpenSSH has ExposeAuthInfo
+enabled in `sshd_config`. Note, that the default of that option
+is disabled. Using this way is usually preferred.
+
+2. `get_ssh_journal_info()`
+
+This is available when the crate is build with the "journal"
+feature. The function will traverse through the process tree to
+find the parent sshd PID. Once found the PID is being used to check
+the systemd journal for the key fingerprint having been used for
+the connection. Last but not least the `~/.ssh/authorized_keys` is
+being examined to find the public key for the fingerprint.
 
 NOTE: The resulting binary must be called with permissions to
 access the system's systemd journal to be functional.
@@ -16,11 +28,15 @@ Examples
 ========
 
 ```rust
-extern crate sshidentify;
-
-/// Print information about first gpiochip
 fn main() {
-	let info = sshidentify::get_ssh_info().unwrap()
+	let info = sshidentify::get_ssh_exposeauth_info().unwrap()
+    println!("SSH Info: {:?}", info);
+}
+```
+
+```rust
+fn main() {
+	let info = sshidentify::get_ssh_journal_info().unwrap()
     println!("SSH Info: {:?}", info);
 }
 ```
@@ -28,7 +44,7 @@ fn main() {
 License
 =======
 
-© 2018 Sebastian Reichel
+© 2018-2024 Sebastian Reichel
 
 ISC License
 

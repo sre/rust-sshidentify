@@ -26,18 +26,14 @@
 //! }
 //! ```
 
-extern crate nix;
-extern crate libc;
-extern crate systemd;
-extern crate regex;
-extern crate base64;
-extern crate sha2;
-extern crate md5;
-
-use std::io;
+use std::{env, fs, io};
 use std::io::BufRead;
+#[cfg(feature = "journal")]
 use sha2::Digest;
+#[cfg(feature = "journal")]
+use base64::Engine as _;
 
+#[cfg(feature = "journal")]
 #[derive(Debug)]
 struct ProcessInfo {
     pid: nix::unistd::Pid,
@@ -46,15 +42,16 @@ struct ProcessInfo {
     name: String,
 }
 
+#[cfg(feature = "journal")]
 #[derive(Debug)]
 struct SSHLogInfo {
-    username: String,
     ip: String,
     keytype: String,
     fingerprint: String,
     fptype: SSHFingerprintType,
 }
 
+#[cfg(feature = "journal")]
 #[derive(Debug)]
 struct SSHPubKey {
     keytype: String,
@@ -62,6 +59,7 @@ struct SSHPubKey {
     comment: String,
 }
 
+#[cfg(feature = "journal")]
 #[derive(Debug)]
 pub enum SSHFingerprintType {
     MD5,
@@ -70,12 +68,6 @@ pub enum SSHFingerprintType {
 
 #[derive(Debug)]
 pub struct SSHInfo {
-    /// type of the fingerprint found in the systemd journal
-    pub fingerprint_type: SSHFingerprintType,
-    /// fingerprint found in the systemd journal
-    pub fingerprint: String,
-    /// local username of the ssh connection
-    pub username: String,
     /// remote ip of the ssh connection
     pub ip: String,
     /// type of the public key
@@ -86,6 +78,7 @@ pub struct SSHInfo {
     pub comment: String,
 }
 
+#[cfg(feature = "journal")]
 /// read process info for a PID from procfs (Linux only)
 fn get_pid_info(pid: nix::unistd::Pid) -> std::io::Result<ProcessInfo> {
     let pid_info_file = format!("/proc/{}/status", pid);
@@ -117,6 +110,7 @@ fn get_pid_info(pid: nix::unistd::Pid) -> std::io::Result<ProcessInfo> {
     Ok(ProcessInfo { pid, ppid, uid, name } )
 }
 
+#[cfg(feature = "journal")]
 /// walk through parent processes until sshd process is found
 fn get_sshd_pid() -> std::io::Result<nix::unistd::Pid> {
     let mut info = get_pid_info(nix::unistd::getppid())?;
@@ -136,6 +130,7 @@ fn get_sshd_pid() -> std::io::Result<nix::unistd::Pid> {
     }
 }
 
+#[cfg(feature = "journal")]
 /// find "Accepted publickey" message for provided pid in systemd journal
 fn get_sshd_journal_entry(pid: nix::unistd::Pid) -> std::io::Result<String> {
     let mut journal = systemd::journal::OpenOptions::default().system(true).open()?;
@@ -163,6 +158,7 @@ fn get_sshd_journal_entry(pid: nix::unistd::Pid) -> std::io::Result<String> {
     Err(io::Error::new(io::ErrorKind::NotFound, "sshd log entry not found"))
 }
 
+#[cfg(feature = "journal")]
 /// decode Accepted publickey log message from ssh
 fn decode_ssh_log(message: &str) -> std::io::Result<SSHLogInfo> {
     // ... (username) ... (ip) ... (keytype) ... (keyhash)
@@ -181,17 +177,18 @@ fn decode_ssh_log(message: &str) -> std::io::Result<SSHLogInfo> {
     }
 
     let cap = caps.unwrap();
-    let username = cap.get(1).unwrap().as_str().to_string();
+    let _username = cap.get(1).unwrap().as_str().to_string();
     let ip = cap.get(2).unwrap().as_str().to_string();
     let keytype = cap.get(3).unwrap().as_str().to_string();
     let fingerprint = cap.get(4).unwrap().as_str().to_string();
 
-    Ok(SSHLogInfo{username: username, ip: ip, keytype: keytype, fptype: fptype, fingerprint: fingerprint})
+    Ok(SSHLogInfo{ip: ip, keytype: keytype, fptype: fptype, fingerprint: fingerprint})
 }
 
+#[cfg(feature = "journal")]
 /// generate fingerprint hash
 fn key2fp(loginfo: &SSHLogInfo, pubkey64: &str) -> io::Result<String> {
-    let pubkeydata = match base64::decode(pubkey64) {
+    let pubkeydata = match base64::engine::general_purpose::STANDARD.decode(pubkey64) {
         Ok(data) => data,
         Err(_err) => return Err(io::Error::new(io::ErrorKind::InvalidData, "Failed to Decode mime64 pubkey")),
     };
@@ -201,7 +198,7 @@ fn key2fp(loginfo: &SSHLogInfo, pubkey64: &str) -> io::Result<String> {
             let mut hasher = sha2::Sha256::new();
             hasher.update(&pubkeydata);
             let hashed = hasher.finalize();
-            let fp64 = base64::encode(&hashed);
+            let fp64 = base64::engine::general_purpose::STANDARD.encode(&hashed);
             return Ok(fp64.trim_end_matches('=').to_string());
         },
         SSHFingerprintType::MD5 => {
@@ -214,9 +211,10 @@ fn key2fp(loginfo: &SSHLogInfo, pubkey64: &str) -> io::Result<String> {
     }
 }
 
+#[cfg(feature = "journal")]
 /// get authorized_key information for publickey fingerprint
 fn ssh_get_authorized_key(loginfo: &SSHLogInfo) -> std::io::Result<SSHPubKey> {
-    let mut authfile = home::home_dir().unwrap();
+    let mut authfile = dirs::home_dir().unwrap();
     authfile.push(".ssh");
     authfile.push("authorized_keys");
     let f = std::fs::File::open(authfile)?;
@@ -248,6 +246,70 @@ fn ssh_get_authorized_key(loginfo: &SSHLogInfo) -> std::io::Result<SSHPubKey> {
     Err(io::Error::new(io::ErrorKind::NotFound, "Fingerprint not found in authorized_key file"))
 }
 
+#[cfg(feature = "exposeauth")]
+/// generate SSHInfo by using environment variables exposed by ExposeAuthInfo sshd config
+pub fn get_ssh_exposeauth_info() -> std::io::Result<SSHInfo> {
+    let ssh_user_auth_file = match env::var("SSH_USER_AUTH") {
+        Ok(x) => x,
+        Err(e) => return Err(io::Error::new(io::ErrorKind::NotFound, e.to_string())),
+    };
+    let ssh_user_auth_raw = fs::read_to_string(ssh_user_auth_file)?;
+    let ssh_client_raw = match env::var("SSH_CLIENT") {
+        Ok(x) => x,
+        Err(e) => return Err(io::Error::new(io::ErrorKind::NotFound, e.to_string())),
+    };
+    let ssh_user_auth: Vec<&str> = ssh_user_auth_raw.split(" ").collect();
+    let ssh_client: Vec<&str> = ssh_client_raw.split(" ").collect();
+
+    if ssh_client.len() != 3 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid SSH_CLIENT"))
+    }
+
+    if ssh_user_auth.len() != 3 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid SSH_USER_AUTH"))
+    }
+
+    let ip = ssh_client[0];
+    let logintype = ssh_user_auth[0];
+    let keytype = ssh_user_auth[1];
+    let keydata = ssh_user_auth[2].trim_end();
+
+    if logintype != "publickey" {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "SSH login must happen via public key"))
+    }
+
+    let mut authfile = dirs::home_dir().unwrap();
+    authfile.push(".ssh");
+    authfile.push("authorized_keys");
+    let f = std::fs::File::open(authfile)?;
+    let file = std::io::BufReader::new(&f);
+
+    for line in file.lines() {
+        let l = line.unwrap();
+        let parts : Vec<&str> = l.splitn(3, ' ').collect();
+
+        if parts.len() != 3 {
+            continue;
+        }
+
+        let auth_keytype = parts[0];
+        let auth_pubkey = parts[1];
+        let auth_comment = parts[2];
+
+        if keytype == auth_keytype && keydata == auth_pubkey {
+            return Ok(SSHInfo{
+                ip: ip.to_string(),
+                keytype: keytype.to_string(),
+                keydata: keydata.to_string(),
+                comment: auth_comment.to_string(),
+            });
+        }
+    }
+
+    Err(io::Error::new(io::ErrorKind::NotFound, "Fingerprint not found in authorized_key file"))
+}
+
+#[cfg(feature = "journal")]
 /// get ssh key information for UID
 pub fn get_ssh_journal_info() -> std::io::Result<SSHInfo> {
     let pid = get_sshd_pid()?;
@@ -255,5 +317,10 @@ pub fn get_ssh_journal_info() -> std::io::Result<SSHInfo> {
     let info = decode_ssh_log(&msg)?;
     let auth = ssh_get_authorized_key(&info)?;
 
-    Ok(SSHInfo{fingerprint_type: info.fptype, fingerprint: info.fingerprint, username: info.username, ip: info.ip, keytype: auth.keytype, keydata: auth.keydata, comment: auth.comment})
+    Ok(SSHInfo{
+        ip: info.ip,
+        keytype: auth.keytype,
+        keydata: auth.keydata,
+        comment: auth.comment,
+    })
 }
